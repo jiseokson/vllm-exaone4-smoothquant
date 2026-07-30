@@ -115,13 +115,24 @@ class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
     ) -> torch.Tensor:
         w_q, w_s, i_s, i_zp, azp_adj = self._get_layer_params(layer)
 
-        # ops.scaled_int8_quant supports both dynamic and static quant:
-        # * dynamic, i_s is None and x_s computed from x.
-        # * static, i_s is scalar and x_s is i_s.
-        symmetric = azp_adj is None
-        x_q, x_s, x_zp = ops.scaled_int8_quant(
-            x.contiguous(), i_s, i_zp, symmetric=symmetric
-        )
+        # If the layer carries a SmoothQuant input scale (set by
+        # Exaone4ForCausalLM_pre_identity after weight loading), fuse the
+        # per-channel scaling with per-token INT8 quantization in one kernel.
+        smooth_scale = getattr(layer, "smooth_scale", None)
+        if smooth_scale is not None:
+            from vllm.model_executor.layers.ops.smooth_quant import (
+                smooth_scale_quant_int8,
+            )
+            x_q, x_s = smooth_scale_quant_int8(x, smooth_scale)
+            x_zp = None
+        else:
+            # ops.scaled_int8_quant supports both dynamic and static quant:
+            # * dynamic, i_s is None and x_s computed from x.
+            # * static, i_s is scalar and x_s is i_s.
+            symmetric = azp_adj is None
+            x_q, x_s, x_zp = ops.scaled_int8_quant(
+                x.contiguous(), i_s, i_zp, symmetric=symmetric
+            )
 
         if x_zp is not None:
             # Currently, static is always per-tensor and dynamic is per-token

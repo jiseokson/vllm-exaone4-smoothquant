@@ -116,6 +116,9 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        smooth_scale = getattr(layer, "smooth_scale", None)
+        if smooth_scale is not None:
+            x = x * smooth_scale
         return apply_nvfp4_linear(
             backend=self.backend,
             layer=layer,
