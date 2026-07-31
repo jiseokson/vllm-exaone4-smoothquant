@@ -215,7 +215,7 @@ class Exaone4Attention(nn.Module):
         return output
 
 
-class IdentityWithParam(nn.Module):
+class ActivationScaleLayer(nn.Module):
     def __init__(self, size):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(size))
@@ -262,8 +262,8 @@ class Exaone4DecoderLayer(nn.Module):
             bias=getattr(config, "mlp_bias", False),
             prefix=f"{prefix}.mlp",
         )
-        self.pre_attention_identity = IdentityWithParam(config.hidden_size)
-        self.pre_feedforward_identity = IdentityWithParam(config.hidden_size)
+        self.attn_scaler = ActivationScaleLayer(config.hidden_size)
+        self.ffn_scaler = ActivationScaleLayer(config.hidden_size)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -283,6 +283,7 @@ class Exaone4DecoderLayer(nn.Module):
         # NOTE: pre_attention_identity scale is attached to qkv_proj as a
         # smooth_scale buffer after weight loading. The fused kernel inside
         # CutlassInt8ScaledMMLinearKernel.apply_weights handles scaling + quant.
+        hidden_states = self.attn_scaler(hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -296,6 +297,7 @@ class Exaone4DecoderLayer(nn.Module):
 
         # Fully Connected
         # NOTE: pre_feedforward_identity scale is attached to gate_up_proj.
+        hidden_states = self.ffn_scaler(hidden_states)
         hidden_states = self.mlp(hidden_states)
 
         # Use post-LN
@@ -448,7 +450,7 @@ class Exaone4Model(nn.Module):
         return loaded_params
 
 
-class Exaone4ForCausalLM_pre_identity(nn.Module, SupportsLoRA, SupportsPP):
+class Exaone4ForCausalLMSmoothQuantReference(nn.Module, SupportsLoRA, SupportsPP):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -530,33 +532,4 @@ class Exaone4ForCausalLM_pre_identity(nn.Module, SupportsLoRA, SupportsPP):
             # processed with quantization, LoRA, fine-tuning, etc.
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        loaded = loader.load_weights(weights)
-        self._attach_smooth_scales()
-        return loaded
-
-    def _attach_smooth_scales(self) -> None:
-        """Move pre_identity weights into adjacent linear layers as smooth_scale
-        buffers so that CutlassInt8ScaledMMLinearKernel can fuse the
-        per-channel scaling with per-token INT8 quantization in one kernel,
-        eliminating a separate element-wise pass over hidden_states.
-
-        Mapping:
-          pre_attention_identity.weight  → self_attn.qkv_proj.smooth_scale
-          pre_feedforward_identity.weight → mlp.gate_up_proj.smooth_scale
-        """
-        for layer in self.model.layers:
-            if isinstance(layer, PPMissingLayer):
-                continue
-
-            s_attn = layer.pre_attention_identity.weight.data.to(torch.float32)
-            s_ffn = layer.pre_feedforward_identity.weight.data.to(torch.float32)
-
-            # qkv_proj is a QKVParallelLinear whose quant_method.apply() calls
-            # the kernel; attach scale as a plain buffer (not a Parameter so it
-            # does not appear in optimizer state).
-            layer.self_attn.qkv_proj.register_buffer(
-                "smooth_scale", s_attn, persistent=False
-            )
-            layer.mlp.gate_up_proj.register_buffer(
-                "smooth_scale", s_ffn, persistent=False
-            )
+        return loader.load_weights(weights)
